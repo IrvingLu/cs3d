@@ -1,0 +1,713 @@
+
+import { vec3, vec2 } from "gl-matrix";
+import getSvgDrawingHelper from "@/visual/tool/utils/getSvgDrawingHelper";
+import {
+  getEnabledElement,
+  Types,
+  Enums,
+  utilities,
+} from "@cornerstonejs/core";
+import * as cornerstoneTools from "@cornerstonejs/tools";
+const {
+  annotation,
+  utilities: toolUtils,
+  segmentation,
+  Enums: toolEnums,
+  BaseTool,
+  drawing,
+} = cornerstoneTools;
+import { Types as toolTypes } from "@cornerstonejs/tools";
+
+class VariationTool extends BaseTool {
+  static toolName: string;
+  private hoverTimer: ReturnType<typeof setTimeout> | null;
+  editData!: {
+    segmentationId: string; //分割id
+    planeContours: any; //当前平面层的所有轮廓
+    viewport: Types.IVolumeViewport | Types.IStackViewport; //视口
+  } | null;
+  private _hoverData?: {
+    brushCursor: any;
+    segmentationId: string;
+    segmentIndex: number;
+    segmentationRepresentationUID: string;
+    segmentColor: [number, number, number, number];
+    viewportIdsToRender: string[];
+    centerCanvas?: Types.Point2;
+  };
+
+  constructor(
+    toolProps: toolTypes.PublicToolProps = {},
+    defaultToolProps: toolTypes.ToolProps = {
+      supportedInteractionTypes: ["Mouse", "Touch"],
+      configuration: {
+        radius: 40, //形变半径
+      },
+    }
+  ) {
+    super(toolProps, defaultToolProps);
+    this.hoverTimer = null;
+  }
+  onSetToolPassive = () => {
+    this.disableCursor();
+  };
+
+  onSetToolEnabled = () => {
+    this.disableCursor();
+  };
+
+  onSetToolDisabled = () => {
+    this.disableCursor();
+  };
+
+  private disableCursor() {
+    this._hoverData = undefined;
+  }
+  /**
+   * 鼠标点击事件
+   * @param evt
+   * @returns
+   */
+
+  preMouseDownCallback = (
+    evt: toolTypes.EventTypes.MouseDownActivateEventType
+  ): boolean => {
+    const eventDetail = evt.detail;
+    const { element, currentPoints } = eventDetail;
+    const enabledElement = getEnabledElement(element)!;
+    const { viewport } = enabledElement!;
+    this._activateDraw(element);
+    if (!this.editData) {
+      return true;
+    }
+    //切面的轮廓，当前层的所有轮廓
+    const planeContours = this.getPlaneContours().map((f: any) => {
+      return {
+        annotationUID: f.annotationUID,
+        contour: f.data.contour.polyline,
+      };
+    });
+    //找到轮廓和圆的交点，插进去
+    for (let i = 0; i < planeContours.length; i++) {
+      const { contour } = planeContours[i];
+      const newPolyline = JSON.parse(JSON.stringify(contour));
+      //求圆跟线段的交点，一个位置一个位置找，确保插入位置正确
+      for (let index = 0, num = contour.length; index < num; index++) {
+        const point1 = viewport.worldToCanvas(
+          contour[index == contour.length - 1 ? 0 : index + 1]
+        );
+        const point2 = viewport.worldToCanvas(contour[index]);
+        //canvas交点坐标
+        var intersection = this.circleLineIntersection(
+          point1[0],
+          point1[1],
+          point2[0],
+          point2[1],
+          currentPoints.canvas[0],
+          currentPoints.canvas[1],
+          this.configuration.radius
+        );
+        //把交点坐标变为世界坐标系
+        const interPoint = intersection.map((ele: Types.Point2) =>
+          viewport.canvasToWorld(ele).map((c) => Number(c.toFixed(2)))
+        );
+        //找到需要插入位置的索引,在后面进行插入
+        let newindex = newPolyline.findIndex(
+          (f: Types.Point3) =>
+            JSON.stringify(f) == JSON.stringify(contour[index])
+        );
+        newPolyline.splice(newindex + 1, 0, ...interPoint);
+      }
+      //更新轮廓的数据
+      planeContours[i].contour = newPolyline;
+    }
+    //初始化值
+    this.editData!.planeContours = planeContours;
+    return true;
+  };
+
+  /**
+   * 监听
+   */
+  _activateDraw = (element: HTMLDivElement): void => {
+    element.addEventListener(
+      toolEnums.Events.MOUSE_UP,
+      this._endCallback as EventListener
+    );
+    element.addEventListener(
+      toolEnums.Events.MOUSE_DRAG,
+      this._dragCallback as EventListener
+    );
+  };
+
+  /**
+   * 取消监听
+   */
+  _deactivateDraw = (element: HTMLDivElement): void => {
+    element.removeEventListener(
+      toolEnums.Events.MOUSE_UP,
+      this._endCallback as EventListener
+    );
+    element.removeEventListener(
+      toolEnums.Events.MOUSE_DRAG,
+      this._dragCallback as EventListener
+    );
+  };
+  /**
+   * 鼠标移动
+   * @param evt
+   * @returns
+   */
+  mouseMoveCallback = (
+    evt: toolTypes.EventTypes.InteractionEventType
+  ): void => {
+    const eventDetail = evt.detail;
+    const { element } = eventDetail;
+    const enabledElement = getEnabledElement(element)!;
+    const { viewport } = enabledElement!;
+    this.editData = null;
+    this.updateCursor(evt);
+    if (this.hoverTimer) {
+      clearTimeout(this.hoverTimer);
+    }
+    this.hoverTimer = setTimeout(() => {
+      const activeSegmentationReps =
+        segmentation.activeSegmentation.getActiveSegmentationRepresentation(
+          this.toolGroupId
+        );
+      if (!activeSegmentationReps) {
+        throw new Error(
+          "No active segmentation detected, create one before using scissors tool"
+        );
+      }
+      const { segmentationId } = activeSegmentationReps;
+      this.editData = {
+        segmentationId,
+        planeContours: [],
+        viewport,
+      };
+      this.hoverTimer = null;
+    }, this.configuration.hoverTimeout);
+  };
+
+  /**
+   * 鼠标拖动
+   * @param evt
+   * @returns
+   */
+  _dragCallback = (evt: toolTypes.EventTypes.InteractionEventType): void => {
+    if (!this.editData) {
+      return;
+    }
+    const eventData = evt.detail;
+    const { element, currentPoints, startPoints } = eventData;
+    const enabledElement = getEnabledElement(element)!;
+    const { viewport } = enabledElement!;
+    const { renderingEngine } = enabledElement!;
+    this.updateCursor(evt);
+    this._triggerAnnotationRender(viewport);
+
+    //我是擎天柱，变形金刚开始变形
+    this.deformShape(this.configuration.radius, {
+      currentPoint: currentPoints.world,
+      startPoint: startPoints.world,
+    });
+    //重新渲染，让你看到变化
+    const viewportIdsToRender =
+      toolUtils.viewportFilters.getViewportIdsWithToolToRender(
+        element,
+        this.getToolName()
+      );
+
+    toolUtils.triggerAnnotationRenderForViewportIds(
+      renderingEngine,
+      viewportIdsToRender
+    );
+  };
+
+  /**
+   * 形变逻辑
+   * 这个代码是这个工具最最最最重要的部分，请好好珍惜奥
+   * 可正经折磨了我好几天
+   */
+  private deformShape(sigma: number, parameters: any) {
+    const { planeContours } = this.editData!;
+    const { currentPoint, startPoint } = parameters;
+    //控制点=>起始点的方向向量，让你知道往哪里拽
+    const directionVector_ = vec3.subtract(
+      vec3.create(),
+      currentPoint,
+      startPoint
+    );
+    //得到这个方向向量的值
+    const directionVector_value = vec3.length(directionVector_);
+    if (directionVector_value < 0.001) {
+      return;
+    }
+    //半径的平方
+    const sigmaSquared_ = sigma * sigma;
+    // 这里使用对数是为了实现一种非线性的缩放效果，使得变形的效果随着距离的变化更加平滑和自然。
+    // 具体来说，对数函数具有这样的性质：在较小的数值区间内变化较快，而在较大的数值区间内变化较慢。这意味着当 directionVector_value 接近于 0.001（即起始点和当前点几乎重合）时，对数函数的变化率会比较大；而当 directionVector_value 增大时，对数函数的变化率会逐渐减小。
+    // 这种设计可以带来以下好处：
+    // 非线性影响区域：靠近起点的点受到的变形影响更大，远离起点的点影响则逐渐减小。这样可以避免因为一点点的移动导致整个形状发生巨大的变化，使变形更加可控和自然。
+    // 防止突变：通过对数函数，可以避免在距离非常接近起点时出现变形上的突变，从而保证变形效果更加平滑。
+    // 可调节性：通过调整 sigma 参数，可以控制变形影响的范围。sigmaSquared_ 是 sigma 的平方，用来调整变形的影响强度和范围。
+    const deformationThreshold_ =
+      sigmaSquared_ * (Math.log(directionVector_value) - Math.log(0.001));
+    for (let i = 0, num = planeContours.length; i < num; i++) {
+      //插值拉伸后的轮廓存储
+      let newPolyline = [] as Types.Point3[];
+      //解构原始轮廓值,注意这里的所有偏移量都是基于原始轮廓来处理。
+      const { annotationUID, contour } = planeContours[i];
+      //上一个点，用于计算插值,起始默认给第一个点
+      let lastPoint = contour[0];
+      //现在开始一个点一个点循环了，谁也跑不了。
+      //就是按点的顺序，如果不在圆内部，这个点就不动，要不就按照缩放比例生成新的点
+      //如果生成了新的点，就要在这个点和上一个点之间插值进行插值，保证轮廓的圆滑
+      for (let j = 0, len = contour.length; j < len; j++) {
+        //当前点
+        const point = contour[j];
+        //当前点=》起点的方向向量
+        let curentToStartVector = vec3.subtract(
+          vec3.create(),
+          point,
+          startPoint
+        );
+        //当前点到起始点的向量距离，未开平方（用于和半径的平方做比较）
+        let vecDistance =
+          curentToStartVector[0] * curentToStartVector[0] +
+          curentToStartVector[1] * curentToStartVector[1] +
+          curentToStartVector[2] * curentToStartVector[2];
+        //默认给原始点,深复制
+        let newPoint = JSON.parse(JSON.stringify(point));
+        //如果点在这个弹性阈值内，就是⚪内
+        if (vecDistance < deformationThreshold_) {
+          //计算偏移的缩放比例，距离圆心越近，偏移量越大
+          //使用 Math.exp 的目的是为了让变形效果随着距离的增加而平滑地减少,指数函数的使用使得变形效果更加自然
+          let scaleValue = Math.exp(-vecDistance / sigmaSquared_);
+          //相对于原点的偏移量
+          const offset = [
+            directionVector_[0] * scaleValue,
+            directionVector_[1] * scaleValue,
+            directionVector_[2] * scaleValue,
+          ];
+          //生成拉伸后新的点
+          newPoint[0] = point[0] + offset[0];
+          newPoint[1] = point[1] + offset[1];
+          newPoint[2] = point[2] + offset[2];
+          //警告警告：接下来就要施展插值法术了
+          //计算一下当前点和上一个点的距离：主要是用于计算这部分的线段需要插值多少个
+          const currentToLastDistanceValue = vec3.squaredDistance(
+            newPoint,
+            lastPoint
+          );
+          //施法中...
+          //0.04000000000000001 这个值参照的是RAY的数据 ,暂时不知道依据是什么
+          if (j > 0 && currentToLastDistanceValue > 0.04000000000000001) {
+            //插值数量
+            const intersectionNum = Math.floor(
+              this.numericallyStableCeiling(
+                6,
+                Math.sqrt(currentToLastDistanceValue) / 0.2
+              ) - 1
+            );
+            for (let k = 0; k < intersectionNum; k++) {
+              //插值点的缩放比例
+              const num8 = (k + 1.0) / (intersectionNum + 1.0);
+              //原始线段的插值的点
+              const point8 = [
+                contour[j - 1][0] + (contour[j][0] - contour[j - 1][0]) * num8,
+                contour[j - 1][1] + (contour[j][1] - contour[j - 1][1]) * num8,
+                contour[j - 1][2] + (contour[j][2] - contour[j - 1][2]) * num8,
+              ] as Types.Point3;
+              //同样的对这个点进行新点的生成
+              curentToStartVector = vec3.subtract(
+                vec3.create(),
+                point8,
+                startPoint
+              );
+              vecDistance =
+                curentToStartVector[0] * curentToStartVector[0] +
+                curentToStartVector[1] * curentToStartVector[1] +
+                curentToStartVector[2] * curentToStartVector[2];
+              scaleValue = Math.exp(-vecDistance / sigmaSquared_);
+              //相对于原点的偏移量
+              const offset = [
+                directionVector_[0] * scaleValue,
+                directionVector_[1] * scaleValue,
+                directionVector_[2] * scaleValue,
+              ];
+              const interPoint = JSON.parse(JSON.stringify(point8));
+              //生成新的点
+              interPoint[0] = point8[0] + offset[0];
+              interPoint[1] = point8[1] + offset[1];
+              interPoint[2] = point8[2] + offset[2];
+              newPolyline.push(interPoint);
+            }
+          }
+        }
+        newPolyline.push(newPoint);
+        lastPoint = newPoint;
+      }
+      //更新轮廓线
+      const element = annotation.state.getAnnotation(annotationUID);
+      element.data.contour.polyline = newPolyline;
+    }
+  }
+  /**
+   * 计算数量
+   * @param n
+   * @param d
+   * @returns
+   */
+  private numericallyStableCeiling(n: number, d: number) {
+    const tenPowCache_ = [
+      1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0,
+      100000000.0, 1000000000.0,
+    ];
+    const tenPowNegCache_ = [
+      1.0, 0.1, 0.01, 0.001, 0.0001, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10,
+    ];
+    let num;
+    let num2;
+    if (n >= 1 && n < tenPowCache_.length) {
+      num = tenPowCache_[n];
+      num2 = tenPowNegCache_[n + 1];
+    } else {
+      num = Math.pow(10.0, n);
+      num2 = Math.pow(10.0, -(n + 1));
+    }
+
+    return Math.ceil(Math.round(d * num) / num - num2);
+  }
+  /**
+   * 获取当前层的所有轮廓
+   */
+  private getPlaneContours() {
+    const { segmentationId, viewport } = this.editData!;
+    let currentImageIndex = viewport.getCurrentImageIdIndex();
+    let sliceIndex = currentImageIndex + 1;
+    const org = viewport.defaultOptions.orientation;
+    const img = viewport.getImageData()!;
+    //暂时不理解为什么矢状面的索引是这种情况？
+    if (org == Enums.OrientationAxis.SAGITTAL) {
+      sliceIndex = img.dimensions[0] - currentImageIndex;
+    }
+    //找到当前层的所有轮廓
+    const segmentations = segmentation.state.getSegmentation(segmentationId)!;
+    const { annotationUIDsMap } = segmentations.representationData.CONTOUR!;
+    let planeContours = [] as any;
+    for (const [_, annotationUIDs] of annotationUIDsMap!.entries()) {
+      Array.from(annotationUIDs).forEach((annotationUID) => {
+        const currentAnnotation = annotation.state.getAnnotation(annotationUID);
+        if (
+          currentAnnotation.metadata.sliceIndex == sliceIndex &&
+          currentAnnotation.data.orientation ==
+            viewport.defaultOptions.orientation
+        ) {
+          planeContours.push(currentAnnotation);
+        }
+      });
+    }
+    return planeContours;
+  }
+
+  /**
+   * 松手
+   */
+  _endCallback = (evt: toolTypes.EventTypes.InteractionEventType): void => {
+    const eventDetail = evt.detail;
+    const { element } = eventDetail;
+    this._deactivateDraw(element);
+  };
+  /**
+   * 激活渲染
+   * @param viewport
+   */
+  _triggerAnnotationRender(
+    viewport: Types.IStackViewport | Types.IVolumeViewport
+  ) {
+    const { element } = viewport;
+    const enabledElement = getEnabledElement(element)!;
+    const svgDrawingHelper = getSvgDrawingHelper(element);
+    this.renderAnnotation(enabledElement, svgDrawingHelper);
+  }
+  /**
+   * 绘制，鼠标样式
+   * @param enabledElement
+   * @param svgDrawingHelper
+   * @returns
+   */
+  renderAnnotation(
+    enabledElement: Types.IEnabledElement,
+    svgDrawingHelper: toolTypes.SVGDrawingHelper
+  ): void {
+    if (!this._hoverData) {
+      return;
+    }
+    const { viewport } = enabledElement;
+    const viewportIdsToRender = this._hoverData!.viewportIdsToRender;
+    if (!viewportIdsToRender.includes(viewport.id)) {
+      return;
+    }
+    const brushCursor = this._hoverData!.brushCursor;
+    const { centerCanvas } = this._hoverData!;
+    if (brushCursor.data.invalidated === true) {
+      const { element } = viewport;
+      this._calculateCursor(element, centerCanvas);
+    }
+    const toolMetadata = brushCursor.metadata;
+    const annotationUID = toolMetadata.brushCursorUID;
+
+    const data = brushCursor.data;
+    const { points } = data.handles;
+    const canvasCoordinates = points.map((p: any) => viewport.worldToCanvas(p));
+    const bottom = canvasCoordinates[0];
+    const top = canvasCoordinates[1];
+    const center = [
+      Math.floor((bottom[0] + top[0]) / 2),
+      Math.floor((bottom[1] + top[1]) / 2),
+    ];
+    const radius = Math.abs(bottom[1] - Math.floor((bottom[1] + top[1]) / 2));
+    if (!viewport.getRenderingEngine()) {
+      console.warn("Rendering Engine has been destroyed");
+      return;
+    }
+    //画样式
+    const circleUID = "0";
+    drawing.drawCircle(
+      svgDrawingHelper,
+      annotationUID,
+      circleUID,
+      center as Types.Point2,
+      radius,
+      {
+        color: "white",
+        lineDash: [4, 4],
+      }
+    );
+    const centerUID = "1";
+    const size = 6;
+    const centerPoly = [
+      [center[0] - size, center[1]],
+      [center[0], center[1] + size],
+      [center[0] + size, center[1]],
+      [center[0], center[1] - size],
+      [center[0] - size, center[1]],
+    ] as Types.Point2[];
+    drawing.drawPolyline(svgDrawingHelper, centerUID, "preview", centerPoly, {
+      color: "white",
+      width: 1,
+    });
+  }
+
+  /**
+   * 初始化鼠标
+   */
+  invalidateCursor() {
+    if (this._hoverData !== undefined) {
+      const { data } = this._hoverData.brushCursor;
+      data.invalidated = true;
+    }
+  }
+  /**
+   * 更新鼠标
+   * @returns
+   */
+  updateCursor(evt: toolTypes.EventTypes.InteractionEventType) {
+    const eventData = evt.detail;
+    const { element } = eventData;
+    const { currentPoints } = eventData;
+    const centerCanvas = currentPoints.canvas;
+    this._hoverData = this.createHoverData(element, centerCanvas);
+    const enabledElement = getEnabledElement(element);
+    const { viewport } = enabledElement!;
+
+    this._calculateCursor(element, centerCanvas);
+    if (!this._hoverData) {
+      return;
+    }
+    this._triggerAnnotationRender(viewport);
+  }
+  /**
+   * 创建hover的对象
+   * @param element
+   * @returns
+   */
+  createHoverData(element: any, centerCanvas: any) {
+    const enabledElement = getEnabledElement(element);
+    const { viewport } = enabledElement!;
+
+    const camera = viewport.getCamera();
+    const { viewPlaneNormal, viewUp } = camera;
+
+    const toolGroupId = this.toolGroupId;
+
+    const activeSegmentationRepresentation =
+      segmentation.activeSegmentation.getActiveSegmentationRepresentation(
+        toolGroupId
+      );
+    if (!activeSegmentationRepresentation) {
+      console.warn(
+        "No active segmentation detected, create one before using the brush tool"
+      );
+      return;
+    }
+
+    const { segmentationRepresentationUID, segmentationId } =
+      activeSegmentationRepresentation;
+    const segmentIndex =
+      segmentation.segmentIndex.getActiveSegmentIndex(segmentationId)!;
+
+    const segmentColor = segmentation.config.color.getColorForSegmentIndex(
+      toolGroupId,
+      segmentationRepresentationUID,
+      1
+    );
+
+    const viewportIdsToRender = [viewport.id];
+
+    // Center of circle in canvas Coordinates
+
+    const brushCursor = {
+      metadata: {
+        viewPlaneNormal: <Types.Point3>[...viewPlaneNormal!],
+        viewUp: <Types.Point3>[...viewUp!],
+        FrameOfReferenceUID: viewport.getFrameOfReferenceUID(),
+        referencedImageId: "",
+        toolName: this.getToolName(),
+        segmentColor,
+      },
+      data: {},
+    };
+
+    return {
+      brushCursor,
+      centerCanvas,
+      segmentIndex,
+      segmentationId,
+      segmentationRepresentationUID,
+      segmentColor,
+      viewportIdsToRender,
+    };
+  }
+
+  /**
+   * 计算圆圈的坐标
+   * @param element
+   * @param centerCanvas
+   */
+  _calculateCursor(element: any, centerCanvas?: any) {
+    const enabledElement = getEnabledElement(element);
+    const { viewport } = enabledElement!;
+    const { canvasToWorld } = viewport;
+    const camera = viewport.getCamera();
+    const { radius } = this.configuration;
+
+    const viewUp = vec3.fromValues(
+      camera.viewUp![0],
+      camera.viewUp![1],
+      camera.viewUp![2]
+    );
+    const viewPlaneNormal = vec3.fromValues(
+      camera.viewPlaneNormal![0],
+      camera.viewPlaneNormal![1],
+      camera.viewPlaneNormal![2]
+    );
+    const viewRight = vec3.create();
+
+    vec3.cross(viewRight, viewUp, viewPlaneNormal);
+
+    // in the world coordinate system, the brushSize is the radius of the circle
+    // in mm
+    const centerCursorInWorld: Types.Point3 = canvasToWorld([
+      centerCanvas[0],
+      centerCanvas[1],
+    ]);
+
+    const bottomCursorInWorld = vec3.create();
+    const topCursorInWorld = vec3.create();
+    const leftCursorInWorld = vec3.create();
+    const rightCursorInWorld = vec3.create();
+
+    // Calculate the bottom and top points of the circle in world coordinates
+    for (let i = 0; i <= 2; i++) {
+      bottomCursorInWorld[i] = centerCursorInWorld[i] - viewUp[i] * radius;
+      topCursorInWorld[i] = centerCursorInWorld[i] + viewUp[i] * radius;
+      leftCursorInWorld[i] = centerCursorInWorld[i] - viewRight[i] * radius;
+      rightCursorInWorld[i] = centerCursorInWorld[i] + viewRight[i] * radius;
+    }
+    const { brushCursor } = this._hoverData!;
+    const { data } = brushCursor;
+    if (data.handles === undefined) {
+      data.handles = {};
+    }
+    data.handles.points = [
+      bottomCursorInWorld,
+      topCursorInWorld,
+      leftCursorInWorld,
+      rightCursorInWorld,
+    ];
+    data.invalidated = false;
+  }
+
+  /**
+   * 获取当前分割id
+   * @returns
+   */
+  getSegmentationId() {
+    const { segmentationId } = this.editData!;
+    return segmentationId;
+  }
+
+  /**
+   * 计算圆和线的交点
+   * @param x1
+   * @param y1
+   * @param x2
+   * @param y2
+   * @param cx
+   * @param cy
+   * @param r
+   * @returns
+   */
+  private circleLineIntersection(
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+    cx: number,
+    cy: number,
+    r: number
+  ) {
+    // 计算方向向量
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    // 计算t的系数
+    const A = dx * dx + dy * dy;
+    const B = 2 * (dx * (x1 - cx) + dy * (y1 - cy));
+    const C =
+      cx * cx + cy * cy + x1 * x1 + y1 * y1 - 2 * (cx * x1 + cy * y1) - r * r;
+    // 解二次方程 at^2 + bt + c = 0
+    const discriminant = B * B - 4 * A * C;
+    if (discriminant < 0) {
+      return []; // 无交点
+    }
+    let result = [] as Types.Point2[];
+    // 两个根
+    const sqrtDiscriminant = Math.sqrt(discriminant);
+    const t1 = (-B + sqrtDiscriminant) / (2 * A);
+    const t2 = (-B - sqrtDiscriminant) / (2 * A);
+    // 检查t是否在线段范围内 [0, 1]
+    if (t1 >= 0 && t1 <= 1) {
+      result.push([x1 + t1 * dx, y1 + t1 * dy]);
+    }
+    if (t2 >= 0 && t2 <= 1) {
+      result.push([x1 + t2 * dx, y1 + t2 * dy]);
+    }
+    return result;
+  }
+}
+
+VariationTool.toolName = "VariationTool";
+export default VariationTool;
