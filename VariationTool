@@ -302,7 +302,6 @@ class VariationTool extends BaseTool {
             lastPoint
           );
           //施法中...
-          //0.04000000000000001 这个值参照的是RAY的数据 ,暂时不知道依据是什么
           if (j > 0 && currentToLastDistanceValue > 0.04000000000000001) {
             //插值数量
             const intersectionNum = Math.floor(
